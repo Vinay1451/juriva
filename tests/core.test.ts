@@ -2,10 +2,11 @@
 // JURIVA — Core Tests
 // ============================================================
 
-import { validateFile } from '@/lib/validation';
+import { validateFile, formatFileSize } from '@/lib/validation';
 import { chunkDocument } from '@/lib/documents/processor';
 import { retrieveRelevantChunks } from '@/lib/retrieval/search';
-import { saveDocument, getDocument, getAllDocuments, deleteDocument, generateDocumentId } from '@/lib/documents/store';
+import { saveDocument, getDocument, getAllDocuments, deleteDocument, generateDocumentId, getStoreStats } from '@/lib/documents/store';
+import { checkRateLimit, sanitizeInput, getSecurityHeaders, getClientIdentifier, validateContentType } from '@/lib/security';
 
 // ── File Validation Tests ──────────────────────────────────
 
@@ -67,6 +68,36 @@ describe('File Validation', () => {
     expect(result.valid).toBe(true);
     expect(result.fileType).toBe('txt');
   });
+
+  test('rejects file with unknown extension and no MIME', () => {
+    const file = new File(['content'], 'test.xyz', { type: '' });
+    Object.defineProperty(file, 'size', { value: 100 });
+    const result = validateFile(file);
+    expect(result.valid).toBe(false);
+  });
+
+  test('validates file at exact size limit boundary', () => {
+    const file = new File(['content'], 'exact.pdf', { type: 'application/pdf' });
+    Object.defineProperty(file, 'size', { value: 10 * 1024 * 1024 });
+    const result = validateFile(file);
+    expect(result.valid).toBe(true);
+  });
+});
+
+// ── File Size Formatting Tests ─────────────────────────────
+
+describe('File Size Formatting', () => {
+  test('formats bytes correctly', () => {
+    expect(formatFileSize(500)).toBe('500 B');
+  });
+
+  test('formats kilobytes correctly', () => {
+    expect(formatFileSize(2048)).toBe('2.0 KB');
+  });
+
+  test('formats megabytes correctly', () => {
+    expect(formatFileSize(5 * 1024 * 1024)).toBe('5.0 MB');
+  });
 });
 
 // ── Document Chunking Tests ────────────────────────────────
@@ -100,6 +131,26 @@ describe('Document Chunking', () => {
     const text = 'SECTION 1. Introduction\n\nContent here.\n\nSECTION 2. Terms\n\nMore content here about terms and conditions that apply to both parties in the agreement.';
     const chunks = chunkDocument(text, 1);
     expect(chunks.length).toBeGreaterThan(0);
+  });
+
+  test('chunk IDs are unique and sequential', () => {
+    const text = Array(15).fill('Legal content paragraph for testing unique chunk identifiers in the system.').join('\n\n');
+    const chunks = chunkDocument(text, 3);
+    const ids = chunks.map(c => c.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(chunks[0].index).toBe(0);
+  });
+
+  test('handles single paragraph text', () => {
+    const text = 'Short legal document content.';
+    const chunks = chunkDocument(text, 1);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].text).toContain('Short legal');
+  });
+
+  test('handles whitespace-only text', () => {
+    const chunks = chunkDocument('   \n\n   \n   ', 1);
+    expect(chunks.length).toBe(0);
   });
 });
 
@@ -148,6 +199,17 @@ describe('TF-IDF Retrieval', () => {
     const results = retrieveRelevantChunks('test', mockChunks, 100);
     expect(results.length).toBe(mockChunks.length);
   });
+
+  test('ranks non-compete query correctly', () => {
+    const results = retrieveRelevantChunks('non-compete restriction period', mockChunks, 2);
+    expect(results[0].id).toBe('c3');
+  });
+
+  test('retrieves with single-word query', () => {
+    const results = retrieveRelevantChunks('payment', mockChunks, 2);
+    expect(results.length).toBe(2);
+    expect(results[0].id).toBe('c2');
+  });
 });
 
 // ── Document Store Tests ───────────────────────────────────
@@ -193,6 +255,120 @@ describe('Document Store', () => {
     const id2 = generateDocumentId();
     expect(id1).not.toBe(id2);
     expect(id1).toMatch(/^doc_/);
+  });
+
+  test('returns store statistics', () => {
+    const stats = getStoreStats();
+    expect(stats).toHaveProperty('documentCount');
+    expect(stats).toHaveProperty('maxDocuments');
+    expect(stats.maxDocuments).toBe(50);
+  });
+
+  test('delete returns false for non-existent document', () => {
+    const result = deleteDocument('does-not-exist');
+    expect(result).toBe(false);
+  });
+});
+
+// ── Security Middleware Tests ──────────────────────────────
+
+describe('Security - Rate Limiting', () => {
+  test('allows first request', () => {
+    const result = checkRateLimit('test-ip-unique-1');
+    expect(result.allowed).toBe(true);
+    expect(result.remaining).toBeGreaterThan(0);
+  });
+
+  test('tracks remaining requests', () => {
+    const id = 'test-ip-unique-2';
+    const first = checkRateLimit(id);
+    const second = checkRateLimit(id);
+    expect(second.remaining).toBe(first.remaining - 1);
+  });
+
+  test('different IPs are tracked independently', () => {
+    const r1 = checkRateLimit('ip-a-unique');
+    const r2 = checkRateLimit('ip-b-unique');
+    expect(r1.allowed).toBe(true);
+    expect(r2.allowed).toBe(true);
+  });
+});
+
+describe('Security - Input Sanitization', () => {
+  test('sanitizes normal input', () => {
+    expect(sanitizeInput('Hello World')).toBe('Hello World');
+  });
+
+  test('removes control characters', () => {
+    const result = sanitizeInput('Hello\x00World\x07Test');
+    expect(result).toBe('HelloWorldTest');
+  });
+
+  test('trims whitespace', () => {
+    expect(sanitizeInput('  hello  ')).toBe('hello');
+  });
+
+  test('enforces max length', () => {
+    const long = 'a'.repeat(5000);
+    const result = sanitizeInput(long, 100);
+    expect(result.length).toBe(100);
+  });
+
+  test('handles non-string input', () => {
+    expect(sanitizeInput(null as unknown as string)).toBe('');
+    expect(sanitizeInput(undefined as unknown as string)).toBe('');
+  });
+
+  test('preserves newlines and tabs', () => {
+    const result = sanitizeInput('line1\nline2\ttab');
+    expect(result).toContain('\n');
+    expect(result).toContain('\t');
+  });
+});
+
+describe('Security - Headers', () => {
+  test('returns required security headers', () => {
+    const headers = getSecurityHeaders();
+    expect(headers).toHaveProperty('X-Content-Type-Options', 'nosniff');
+    expect(headers).toHaveProperty('X-Frame-Options', 'DENY');
+    expect(headers).toHaveProperty('X-XSS-Protection');
+    expect(headers).toHaveProperty('Referrer-Policy');
+    expect(headers).toHaveProperty('Permissions-Policy');
+    expect(headers).toHaveProperty('Cache-Control');
+  });
+});
+
+describe('Security - Client Identification', () => {
+  test('extracts IP from X-Forwarded-For', () => {
+    const headers = new Headers({ 'x-forwarded-for': '192.168.1.1, 10.0.0.1' });
+    expect(getClientIdentifier(headers)).toBe('192.168.1.1');
+  });
+
+  test('extracts IP from X-Real-IP', () => {
+    const headers = new Headers({ 'x-real-ip': '172.16.0.1' });
+    expect(getClientIdentifier(headers)).toBe('172.16.0.1');
+  });
+
+  test('falls back to anonymous', () => {
+    const headers = new Headers();
+    expect(getClientIdentifier(headers)).toBe('anonymous');
+  });
+});
+
+describe('Security - Content Type Validation', () => {
+  test('validates JSON content type', () => {
+    const headers = new Headers({ 'content-type': 'application/json' });
+    expect(validateContentType(headers)).toBe(true);
+  });
+
+  test('rejects non-JSON content type', () => {
+    const headers = new Headers({ 'content-type': 'text/plain' });
+    expect(validateContentType(headers)).toBe(false);
+  });
+
+  test('rejects missing content type', () => {
+    const headers = new Headers();
+    expect(validateContentType(headers)).toBe(false);
   });
 });
 
@@ -252,6 +428,36 @@ describe('AI Response Validation', () => {
     expect(unsupported.is_supported).toBe(false);
     expect(unsupported.sources).toHaveLength(0);
   });
+
+  test('validates complete analysis structure with all fields', () => {
+    const analysis = {
+      document_type: 'NDA',
+      summary: 'A mutual non-disclosure agreement.',
+      key_takeaways: ['Mutual obligations', 'Two-year term'],
+      key_clauses: [{ title: 'Confidentiality', text: 'Both parties agree...' }],
+      obligations: [{ party: 'Both', obligation: 'Maintain confidentiality' }],
+      deadlines: [{ date: '2025-12-31', description: 'Agreement expiration' }],
+      attention_areas: [{ title: 'Non-compete', description: 'Restrictive clause' }],
+    };
+    expect(analysis.key_takeaways.length).toBe(2);
+    expect(analysis.key_clauses.length).toBe(1);
+    expect(analysis.obligations.length).toBe(1);
+    expect(analysis.deadlines.length).toBe(1);
+    expect(analysis.attention_areas.length).toBe(1);
+  });
+
+  test('validates comparison change structure', () => {
+    const change = {
+      section: 'Section 5',
+      changeType: 'modified',
+      oldText: 'Original text here',
+      newText: 'Updated text here',
+      explanation: 'Clause language was strengthened.',
+      potentialSignificance: 'high',
+    };
+    expect(['added', 'removed', 'modified']).toContain(change.changeType);
+    expect(change.explanation).toBeTruthy();
+  });
 });
 
 // ── Error Handling Tests ───────────────────────────────────
@@ -295,6 +501,34 @@ describe('Error Handling', () => {
 
     const response = await fetch('/api/analyze');
     expect(response.status).toBe(401);
+
+    global.fetch = originalFetch;
+  });
+
+  test('handles server error responses', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'Internal server error' }),
+    });
+
+    const response = await fetch('/api/analyze');
+    expect(response.status).toBe(500);
+
+    global.fetch = originalFetch;
+  });
+
+  test('handles timeout scenarios', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockRejectedValue(new Error('Timeout'));
+
+    try {
+      await fetch('/api/ask');
+    } catch (err) {
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe('Timeout');
+    }
 
     global.fetch = originalFetch;
   });

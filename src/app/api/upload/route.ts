@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { extractText, chunkDocument } from '@/lib/documents/processor';
 import { saveDocument, generateDocumentId } from '@/lib/documents/store';
+import { checkRateLimit, getClientIdentifier, getSecurityHeaders } from '@/lib/security';
 import { SupportedFileType } from '@/types';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -22,14 +23,26 @@ const ALLOWED_EXTENSIONS: Record<string, SupportedFileType> = {
 };
 
 export async function POST(request: NextRequest) {
+  const secHeaders = getSecurityHeaders();
+
   try {
+    // Rate limiting
+    const clientId = getClientIdentifier(request.headers);
+    const rateLimit = checkRateLimit(clientId);
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: `Rate limit exceeded. Please wait ${rateLimit.retryAfter} seconds.` },
+        { status: 429, headers: { ...secHeaders, 'Retry-After': String(rateLimit.retryAfter) } },
+      );
+    }
+
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
 
     if (!file) {
       return NextResponse.json(
         { error: 'No file provided. Please upload a document.' },
-        { status: 400 }
+        { status: 400, headers: secHeaders },
       );
     }
 
@@ -37,14 +50,14 @@ export async function POST(request: NextRequest) {
     if (file.size === 0) {
       return NextResponse.json(
         { error: 'The file is empty. Please upload a valid document.' },
-        { status: 400 }
+        { status: 400, headers: secHeaders },
       );
     }
 
     if (file.size > MAX_FILE_SIZE) {
       return NextResponse.json(
         { error: `File exceeds the 10 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB).` },
-        { status: 400 }
+        { status: 400, headers: secHeaders },
       );
     }
 
@@ -55,7 +68,7 @@ export async function POST(request: NextRequest) {
     if (!fileType) {
       return NextResponse.json(
         { error: 'Unsupported file format. Please upload a PDF, DOCX, or TXT file.' },
-        { status: 400 }
+        { status: 400, headers: secHeaders },
       );
     }
 
@@ -73,14 +86,14 @@ export async function POST(request: NextRequest) {
     } catch {
       return NextResponse.json(
         { error: 'Could not process this file. It may be corrupted or password-protected.' },
-        { status: 422 }
+        { status: 422, headers: secHeaders },
       );
     }
 
     if (!text.trim()) {
       return NextResponse.json(
         { error: 'No readable text found. The document may be scanned or image-based.' },
-        { status: 422 }
+        { status: 422, headers: secHeaders },
       );
     }
 
@@ -100,19 +113,22 @@ export async function POST(request: NextRequest) {
       pageCount: pages,
     });
 
-    return NextResponse.json({
-      id: documentId,
-      name: file.name,
-      type: fileType,
-      size: file.size,
-      pageCount: pages,
-      chunkCount: chunks.length,
-    });
+    return NextResponse.json(
+      {
+        id: documentId,
+        name: file.name,
+        type: fileType,
+        size: file.size,
+        pageCount: pages,
+        chunkCount: chunks.length,
+      },
+      { headers: secHeaders },
+    );
 
   } catch {
     return NextResponse.json(
       { error: 'An unexpected error occurred during upload. Please try again.' },
-      { status: 500 }
+      { status: 500, headers: secHeaders },
     );
   }
 }
