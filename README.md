@@ -157,5 +157,5 @@ JURIVA is an artificial intelligence application designed solely to assist users
 
 ## License & Attribution
 
-Developed for the GenAI Hackathon - AI Legal Document Intelligence.
+Developed for Hack2skill - AI Legal Document Intelligence Hackathon.
 Copyright 2026 JURIVA Project. All rights reserved.
